@@ -79,6 +79,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     private lateinit var ratioIcon: IconView
     private lateinit var ratioCell: View
     private lateinit var recPill: TextView
+    private lateinit var wmPreview: TextView
     private lateinit var bottomPanel: LinearLayout
     private lateinit var zoomRow: LinearLayout
     private lateinit var modeScroll: HorizontalScrollView
@@ -112,6 +113,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
         prefs = Prefs(this)
+        CamLog.init(prefs)
         ctrl = CameraController(this, prefs, this)
         mode = try { Mode.valueOf(prefs.lastMode) } catch (_: Exception) { Mode.AI_CAM }
         if (mode !in carousel) moreMode = mode
@@ -136,7 +138,14 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         super.onResume()
         grid.visibility = if (prefs.grid) View.VISIBLE else View.GONE
         level.visibility = if (prefs.level) View.VISIBLE else View.GONE
+        zoom = 1f
+        updateZoomUi()
         refreshOptions()
+        ui.postDelayed({ centerSelected() }, 200)
+        Thread {
+            try { DeviceInfo.get(this, prefs) } catch (_: Exception) {}
+            runOnUiThread { refreshWatermarkPreview() }
+        }.start()
         oriListener?.enable()
         if (prefs.level) {
             val acc = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -242,6 +251,15 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         }
         focusBox.visibility = View.GONE
         previewFrame.addView(focusBox, FrameLayout.LayoutParams(dp(72f), dp(72f)))
+        wmPreview = TextView(this)
+        wmPreview.setTextColor(0xF2FFFFFF.toInt())
+        wmPreview.textSize = 11f
+        wmPreview.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        wmPreview.setShadowLayer(dpf(3f), 0f, dpf(1f), 0xAA000000.toInt())
+        wmPreview.visibility = View.GONE
+        previewFrame.addView(wmPreview, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
+            leftMargin = dp(16f); rightMargin = dp(16f); bottomMargin = dp(14f)
+        })
         shotFlash = View(this)
         shotFlash.setBackgroundColor(Color.WHITE)
         shotFlash.alpha = 0f
@@ -267,11 +285,11 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         infoPill.background = GlassDrawable(this)
         infoPill.visibility = View.GONE
         infoPill.setOnClickListener { toggleUnlock() }
-        right.addView(infoPill, LinearLayout.LayoutParams(-2, dp(34f)).apply { rightMargin = dp(8f) })
         right.addView(iconBtn(Ic.GEAR) { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) },
             LinearLayout.LayoutParams(dp(44f), dp(44f)))
         topBar.addView(right, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(16f) })
         root.addView(topBar, FrameLayout.LayoutParams(-1, dp(56f), Gravity.TOP))
+        root.addView(infoPill, FrameLayout.LayoutParams(-2, dp(30f), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
 
         recPill = tv("00:00", 14f, Color.WHITE, true)
         recPill.gravity = Gravity.CENTER
@@ -308,12 +326,19 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
                 if (acc != null) sensorManager?.registerListener(this, acc, SensorManager.SENSOR_DELAY_UI)
             }
         }.first)
+        optionsRow.addView(optCell(Ic.WATERMARK, { if (prefs.watermark) "Aktif" else "Mati" }) {
+            prefs.watermark = !prefs.watermark
+        }.first)
         root.addView(optionsRow, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
 
         // ---- panel bawah
         bottomPanel = LinearLayout(this)
         bottomPanel.orientation = LinearLayout.VERTICAL
         bottomPanel.gravity = Gravity.CENTER_HORIZONTAL
+        bottomPanel.background = GradientDrawable().apply {
+            orientation = GradientDrawable.Orientation.TOP_BOTTOM
+            setColors(intArrayOf(0x00000000, 0xE6000000.toInt(), 0xFF000000.toInt()), floatArrayOf(0f, 0.3f, 0.55f))
+        }
 
         buildProPanel()
         bottomPanel.addView(proPanel, LinearLayout.LayoutParams(-1, -2).apply {
@@ -390,8 +415,9 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     private fun applyInsets() {
         (topBar.layoutParams as FrameLayout.LayoutParams).topMargin = topInset + dp(4f)
         (recPill.layoutParams as FrameLayout.LayoutParams).topMargin = topInset + dp(10f)
-        (optionsRow.layoutParams as FrameLayout.LayoutParams).topMargin = topInset + dp(64f)
-        (msgPill.layoutParams as FrameLayout.LayoutParams).topMargin = topInset + dp(128f)
+        (infoPill.layoutParams as FrameLayout.LayoutParams).topMargin = topInset + dp(66f)
+        (optionsRow.layoutParams as FrameLayout.LayoutParams).topMargin = topInset + dp(102f)
+        (msgPill.layoutParams as FrameLayout.LayoutParams).topMargin = topInset + dp(160f)
         bottomPanel.setPadding(0, 0, 0, bottomInset + dp(8f))
         layoutPreview()
         root.requestLayout()
@@ -429,6 +455,17 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     private fun refreshOptions() {
         optRefresh.forEach { it() }
         ratioCell.visibility = if (!mode.video && mode != Mode.HIRES) View.VISIBLE else View.GONE
+        refreshWatermarkPreview()
+    }
+
+    private fun refreshWatermarkPreview() {
+        val show = prefs.watermark && !mode.video
+        wmPreview.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) return
+        val lp = wmPreview.layoutParams as FrameLayout.LayoutParams
+        lp.gravity = Gravity.BOTTOM or when (prefs.wmPos) { 1 -> Gravity.CENTER_HORIZONTAL; 2 -> Gravity.END; else -> Gravity.START }
+        wmPreview.layoutParams = lp
+        wmPreview.text = if (prefs.wmText.isBlank() && prefs.deviceName.isBlank()) "…" else Watermark.text(this, prefs)
     }
 
     private fun toggleOptions() {
@@ -515,8 +552,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
             val label = if (m != null) m.label else (moreMode?.label ?: "LAINNYA")
             val selected = if (m != null) m == mode else (moreMode != null && moreMode == mode)
             modeViews[i].text = label
-            modeViews[i].setTextColor(if (selected) C.YELLOW else Color.WHITE)
-            modeViews[i].alpha = if (selected) 1f else 0.85f
+            modeViews[i].setTextColor(if (selected) C.YELLOW else 0xE6FFFFFF.toInt())
         }
     }
 
@@ -564,7 +600,17 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         shutter.video = mode.video
         infoPill.visibility = if (mode == Mode.VLOG || mode == Mode.VIDEO) View.VISIBLE else View.GONE
         proPanel.visibility = if (mode == Mode.PRO) View.VISIBLE else View.GONE
+        if (mode != Mode.PRO) resetPro()
         refreshOptions()
+    }
+
+    private fun resetPro() {
+        val c = caps
+        proEv?.progress = (-(c?.evMin ?: 0)).coerceAtLeast(0)
+        proIso?.progress = 0
+        proExp?.progress = 0
+        proFocus?.progress = 0
+        if (proValues.size >= 4) updateProLabels()
     }
 
     // ---------------------------------------------------------- Lainnya

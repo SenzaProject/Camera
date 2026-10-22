@@ -2,6 +2,9 @@ package com.senzaproject.camera
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -15,10 +18,12 @@ import android.util.Size
 import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import kotlin.math.roundToInt
 
 class SettingsActivity : Activity() {
@@ -32,6 +37,7 @@ class SettingsActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
         prefs = Prefs(this)
+        CamLog.init(prefs)
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -121,7 +127,10 @@ class SettingsActivity : Activity() {
         return Pair(row, sw)
     }
 
-    private fun valueRow(title: String, sub: String?, value: () -> String, click: () -> Unit): View {
+    private fun valueRow(title: String, sub: String?, value: () -> String, click: () -> Unit): View =
+        valueRowRef(title, sub, value, click).first
+
+    private fun valueRowRef(title: String, sub: String?, value: () -> String, click: () -> Unit): Pair<View, TextView> {
         val (row, _) = rowBase(title, sub)
         val v = tv(value(), 15f, C.GRAY)
         v.setPadding(dp(8f), 0, 0, 0)
@@ -130,7 +139,7 @@ class SettingsActivity : Activity() {
         chev.rotation = 180f
         row.addView(chev, LinearLayout.LayoutParams(dp(18f), dp(18f)).apply { leftMargin = dp(4f) })
         row.setOnClickListener { click(); v.text = value() }
-        return row
+        return Pair(row, v)
     }
 
     private fun infoRow(title: String, text: String): View {
@@ -192,14 +201,66 @@ class SettingsActivity : Activity() {
             }
         )
 
+        section("Watermark")
+        val devRef = valueRowRef("Nama perangkat terdeteksi", "Ketuk untuk deteksi ulang", { prefs.deviceName.ifBlank { "…" } }) {}
+        devRef.first.setOnClickListener {
+            devRef.second.text = "…"
+            Thread {
+                val n = try { DeviceInfo.refresh(this, prefs) } catch (_: Exception) { "?" }
+                runOnUiThread { devRef.second.text = n }
+            }.start()
+        }
+        Thread {
+            val n = try { DeviceInfo.get(this, prefs) } catch (_: Exception) { "?" }
+            runOnUiThread { devRef.second.text = n }
+        }.start()
+        val textRef = valueRowRef("Teks watermark", "Kosong = otomatis memakai nama perangkat",
+            { if (prefs.wmText.isBlank()) "Otomatis" else prefs.wmText }) {}
+        textRef.first.setOnClickListener { editWatermark { textRef.second.text = if (prefs.wmText.isBlank()) "Otomatis" else prefs.wmText } }
+        card(
+            switchRow("Watermark", "Tulis teks di pojok foto (hanya foto, video belum)", { prefs.watermark }) { prefs.watermark = it }.first,
+            devRef.first,
+            textRef.first,
+            valueRow("Gaya", null, { if (prefs.wmStyle == 0) "Shot on …" else "Nama saja" }) { prefs.wmStyle = 1 - prefs.wmStyle },
+            valueRow("Posisi", null, { when (prefs.wmPos) { 1 -> "Tengah bawah"; 2 -> "Kanan bawah"; else -> "Kiri bawah" } }) {
+                prefs.wmPos = (prefs.wmPos + 1) % 3
+            }
+        )
+
         section("Penyimpanan")
         card(infoRow("Jalur penyimpanan", "Penyimpanan internal\nDCIM/Camera"))
 
         section("Diagnostik kamera")
         card(infoRow("Kemampuan yang dilaporkan HAL", diag()))
 
+        section("Log kamera")
+        card(
+            infoRow("Peristiwa terakhir", CamLog.dump().ifBlank { "(kosong)" }),
+            valueRow("Salin log", "Kirim ke pengembang kalau ada masalah", { "" }) {
+                val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("camera-log", CamLog.dump() + "\n\n" + diag()))
+                Toast.makeText(this, "Log disalin", Toast.LENGTH_SHORT).show()
+            },
+            valueRow("Hapus log", null, { "" }) { CamLog.clear(); recreate() }
+        )
+
         section("Tentang")
-        card(infoRow("Camera 1.0", "SenzaProject"))
+        card(infoRow("Camera 1.1", "SenzaProject"))
+    }
+
+    private fun editWatermark(done: () -> Unit) {
+        val et = EditText(this)
+        et.setText(prefs.wmText)
+        et.hint = "Kosongkan = nama perangkat"
+        et.setSingleLine()
+        et.setTextColor(Color.WHITE)
+        et.setHintTextColor(C.GRAY)
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Teks watermark")
+            .setView(et)
+            .setPositiveButton("Simpan") { _, _ -> prefs.wmText = et.text.toString().trim(); done() }
+            .setNegativeButton("Batal", null)
+            .show()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {

@@ -45,4 +45,11 @@ class Prefs(context: Context) {
     var timer by int("timer", 0)
     var flash by int("flash", 0)
     var lastMode by str("last_mode", "AI_CAM")
+    var watermark by bool("watermark", true)
+    var wmText by str("wm_text", "")
+    var wmStyle by int("wm_style", 0)             // 0 = "Shot on X", 1 = "X"
+    var wmPos by int("wm_pos", 0)                 // 0 kiri, 1 tengah, 2 kanan
+    var deviceName by str("device_name", "")
+    var deviceFp by str("device_fp", "")
+    var log by str("log", "")
 }

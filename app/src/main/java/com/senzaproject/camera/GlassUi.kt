@@ -51,7 +51,7 @@ class GlassDrawable(ctx: Context, private val radius: Float = -1f, private val f
 
 enum class Ic {
     FLASH_OFF, FLASH_AUTO, FLASH_ON, CHEVRON, FLIP, GEAR, TIMER, RATIO, GRID, LEVEL, BACK, CLOSE,
-    PRO, MACRO, TIMELAPSE, HD, PANO, DOC, SLOWMO, DUAL, AIGC, SKY
+    PRO, MACRO, TIMELAPSE, HD, PANO, DOC, SLOWMO, DUAL, AIGC, SKY, WATERMARK
 }
 
 object Icons {
@@ -219,6 +219,12 @@ object Icons {
                 path.lineTo(0f, 0.95f); path.lineTo(-0.2f, 0.2f); path.lineTo(-0.95f, 0f); path.lineTo(-0.2f, -0.2f)
                 path.close()
                 c.drawPath(path, p)
+            }
+            Ic.WATERMARK -> {
+                rect.set(-0.85f, -0.7f, 0.85f, 0.7f)
+                c.drawRoundRect(rect, 0.16f, 0.16f, p)
+                c.drawLine(-0.45f, 0.36f, 0.45f, 0.36f, p)
+                c.drawCircle(0f, -0.1f, 0.22f, p)
             }
             Ic.SKY -> {
                 for (r in floatArrayOf(0.3f, 0.58f, 0.86f)) {

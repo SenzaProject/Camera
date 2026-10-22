@@ -104,6 +104,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     private var lastIso = 100
     private var lastExp = 16_000_000L
     private var attempt = 0
+    private var gen = 0
     private var videoHeight = 1080
     private var videoFps = 30
     private var videoEis = false
@@ -142,6 +143,8 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             closeInternal()
             front = frontFacing
             attempt = 0
+            zoom = 1f
+            CamLog.add("buka kamera ${if (frontFacing) "depan" else "belakang"}")
             try {
                 val id = pickCameraId(frontFacing)
                 if (id == null) {
@@ -159,6 +162,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     fun setMode(m: Mode) {
         handler.post {
+            if (m != Mode.PRO) { evIndex = 0; iso = 0; expNs = 0L; focus = -1f }
             mode = m
             attempt = 0
             if (device != null) configure()
@@ -370,6 +374,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     }
 
     private fun closeSession() {
+        gen++
         try { session?.close() } catch (_: Exception) {}
         session = null
         try { reader?.close() } catch (_: Exception) {}
@@ -415,6 +420,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         val dev = device ?: return
         val st = surfaceTexture ?: return
         val ch = chars ?: return
+        if (recording) return
         closeSession()
         val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
         fpsWindowStart = 0L
@@ -422,23 +428,20 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         try {
             if (mode.video) configureVideo(dev, st, ch, map) else configurePhoto(dev, st, ch, map)
         } catch (e: Exception) {
-            if (mode.video && attempt < 2) {
-                attempt++
-                configure()
-            } else {
-                msg("Gagal konfigurasi kamera: ${e.message}")
-            }
+            onSessionFailed("${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
     private fun configurePhoto(dev: CameraDevice, st: SurfaceTexture, ch: CameraCharacteristics, map: StreamConfigurationMap) {
         val wantRatio = if (mode == Mode.HIRES) 4f / 3f else if (prefs.photoRatio == 1) 16f / 9f else 4f / 3f
         val jpegSizes = map.getOutputSizes(ImageFormat.JPEG)
-        val jpeg = if (mode == Mode.HIRES && jpegSizes != null && jpegSizes.isNotEmpty())
+        val jpegCap = when (attempt) { 0 -> 13_500_000L; 1 -> 8_500_000L; else -> 3_200_000L }
+        val jpeg = if (mode == Mode.HIRES && attempt == 0 && jpegSizes != null && jpegSizes.isNotEmpty())
             jpegSizes.maxByOrNull { it.width.toLong() * it.height }!!
-        else pickSize(jpegSizes, wantRatio, 13_500_000L)
+        else pickSize(jpegSizes, wantRatio, jpegCap)
         val ratio = jpeg.width.toFloat() / jpeg.height
-        val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), ratio, 2_100_000L)
+        val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), ratio, if (attempt >= 2) 1_300_000L else 2_100_000L)
+        CamLog.add("foto ${mode.name} attempt=$attempt jpeg=${jpeg.width}x${jpeg.height} preview=${prev.width}x${prev.height}")
         previewSize = prev
         main.post { cb.onPreviewSize(prev.width, prev.height) }
         st.setDefaultBufferSize(prev.width, prev.height)
@@ -450,7 +453,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         b.addTarget(ps)
         builder = b
         applyCommon(b, false)
-        createSession(dev, listOf(ps, rd.surface), b)
+        createSession(dev, listOf(ps, rd.surface), b, attempt < 2)
     }
 
     private fun configureVideo(dev: CameraDevice, st: SurfaceTexture, ch: CameraCharacteristics, map: StreamConfigurationMap) {
@@ -488,8 +491,9 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         pickFpsRange(ch, fps, unlock && attempt == 0)?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
         applyStabilization(b, eis, unlock && attempt == 0)
         val resLabel = vs.height
+        CamLog.add("video ${mode.name} attempt=$attempt ${vs.width}x${vs.height}@$fps eis=$eis unlock=$unlock")
         main.post { cb.onVideoStatus(resLabel, fps, eis, false) }
-        createSession(dev, listOf(ps, rs), b)
+        createSession(dev, listOf(ps, rs), b, attempt < 2)
     }
 
     private fun pickFpsRange(ch: CameraCharacteristics, fps: Int, force: Boolean): Range<Int>? {
@@ -551,8 +555,12 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             b.set(CaptureRequest.FLASH_MODE, if (torch) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
         }
 
+        if (attempt >= 2) return
+
         if (ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null)
             b.set(CaptureRequest.CONTROL_ZOOM_RATIO, clampZoom(zoom))
+
+        if (attempt >= 1) return
 
         if (prefs.lensCorrection &&
             has(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES, CaptureRequest.DISTORTION_CORRECTION_MODE_HIGH_QUALITY))
@@ -580,35 +588,44 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         }
     }
 
-    private fun createSession(dev: CameraDevice, surfaces: List<Surface>, b: CaptureRequest.Builder) {
+    private fun createSession(dev: CameraDevice, surfaces: List<Surface>, b: CaptureRequest.Builder, useParams: Boolean) {
+        val myGen = ++gen
         val outs = surfaces.map { OutputConfiguration(it) }
-        val sc = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, executor, sessionCb)
-        sc.sessionParameters = b.build()
+        val stateCallback = object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(s: CameraCaptureSession) {
+                if (myGen != gen || device == null) {
+                    try { s.close() } catch (_: Exception) {}
+                    return
+                }
+                session = s
+                CamLog.add("sesi siap (${mode.name}, attempt=$attempt)")
+                startRepeating(true)
+            }
+
+            override fun onConfigureFailed(s: CameraCaptureSession) {
+                if (myGen != gen) return
+                onSessionFailed("onConfigureFailed")
+            }
+        }
+        val sc = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, executor, stateCallback)
+        if (useParams) sc.sessionParameters = b.build()
         dev.createCaptureSession(sc)
     }
 
-    private val sessionCb = object : CameraCaptureSession.StateCallback() {
-        override fun onConfigured(s: CameraCaptureSession) {
-            if (device == null) {
-                s.close()
-                return
-            }
-            session = s
-            startRepeating()
-        }
-
-        override fun onConfigureFailed(s: CameraCaptureSession) {
-            onSessionFailed()
-        }
-    }
-
-    private fun onSessionFailed() {
-        if (mode.video && attempt < 2) {
+    private fun onSessionFailed(reason: String) {
+        CamLog.add("GAGAL ${mode.name} attempt=$attempt: $reason")
+        if (attempt < 2) {
             attempt++
-            msg(if (attempt == 1) "Perangkat menolak 60 fps + EIS, mencoba 30 fps…" else "Mencoba tanpa EIS…")
+            msg(
+                if (mode.video) {
+                    if (attempt == 1) "60 fps + EIS ditolak perangkat, mencoba 30 fps…" else "Mencoba tanpa EIS…"
+                } else {
+                    "Mode ${mode.label} dibatasi perangkat, memakai pengaturan aman…"
+                }
+            )
             configure()
         } else {
-            msg("Gagal membuat sesi kamera")
+            msg("Gagal membuat sesi kamera: $reason")
         }
     }
 
@@ -617,6 +634,10 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExp = it }
             if (mode.video) trackFps(result)
+        }
+
+        override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+            CamLog.add("capture gagal reason=${failure.reason}")
         }
     }
 
@@ -640,13 +661,14 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         }
     }
 
-    private fun startRepeating() {
+    private fun startRepeating(initial: Boolean = false) {
         val s = session ?: return
         val b = builder ?: return
         try {
             s.setRepeatingRequest(b.build(), repeatCb, handler)
         } catch (e: Exception) {
-            onSessionFailed()
+            if (initial) onSessionFailed("repeat: ${e.javaClass.simpleName} ${e.message}")
+            else CamLog.add("repeat error: ${e.message}")
         }
     }
 
@@ -709,8 +731,19 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         io.execute { savePhoto(bytes) }
     }
 
-    private fun savePhoto(bytes: ByteArray) {
+    private fun savePhoto(raw: ByteArray) {
         try {
+            var bytes = raw
+            var marked = false
+            if (prefs.watermark) {
+                try {
+                    bytes = Watermark.apply(raw, Watermark.text(ctx, prefs), prefs.wmPos, prefs.jpegQuality)
+                    marked = true
+                } catch (t: Throwable) {
+                    CamLog.add("watermark gagal: ${t.javaClass.simpleName} ${t.message}")
+                    msg("Watermark gagal, foto disimpan tanpa watermark")
+                }
+            }
             val resolver = ctx.contentResolver
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, "IMG_${stamp()}.jpg")
@@ -720,6 +753,13 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             }
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
             resolver.openOutputStream(uri)?.use { it.write(bytes) }
+            if (marked) {
+                try {
+                    resolver.openFileDescriptor(uri, "rw")?.use { Watermark.copyExif(raw, it.fileDescriptor) }
+                } catch (e: Exception) {
+                    CamLog.add("salin EXIF gagal: ${e.message}")
+                }
+            }
             values.clear()
             values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
