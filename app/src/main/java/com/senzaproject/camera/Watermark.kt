@@ -66,30 +66,37 @@ object DeviceInfo {
         val brandRaw = Build.MANUFACTURER.ifBlank { Build.BRAND }.trim()
         val brand = brandRaw.lowercase().replaceFirstChar { it.uppercase() }
         var name = ""
+        var marketing = false
         for (k in PROPS) {
             val v = getprop(k)
-            if (v.isNotBlank()) { name = v; break }
+            if (v.isNotBlank()) { name = v; marketing = true; break }
         }
         if (name.isBlank()) {
             val m = Build.MODEL.uppercase()
             name = KNOWN.entries.firstOrNull { m.contains(it.key) }?.value ?: ""
+            if (name.isNotBlank()) marketing = true
         }
         if (name.isBlank()) {
             // Nama perangkat bawaan sistem, dipakai hanya kalau tampak seperti nama produk (bukan nama pribadi)
             val dn = try { Settings.Global.getString(ctx.contentResolver, Settings.Global.DEVICE_NAME) } catch (_: Exception) { null }
-            if (!dn.isNullOrBlank() && dn.startsWith(brand, true) && dn.length <= 32 && !dn.equals(Build.MODEL, true)) name = dn
+            if (!dn.isNullOrBlank() && dn.startsWith(brand, true) && dn.length <= 32 && !dn.equals(Build.MODEL, true)) {
+                name = dn
+                marketing = true
+            }
         }
         if (name.isBlank()) name = Build.MODEL
         name = name.trim()
-        if (!name.startsWith(brand, true) && !name.startsWith(Build.BRAND, true)) name = "$brand $name"
+        // Nama pemasaran (mis. "Infinix HOT 50") dipakai apa adanya. Merek hanya ditambahkan pada kode model mentah.
+        // Build.MANUFACTURER bisa dipalsukan ROM (mis. "OnePlus"), jadi tidak boleh ditempel ke nama pemasaran.
+        if (!marketing && !name.startsWith(brand, true) && !name.startsWith(Build.BRAND, true)) name = "$brand $name"
         return name
     }
 
     /** Hasil di-cache; dihitung ulang kalau build ROM berubah. */
     fun get(ctx: Context, p: Prefs): String {
-        if (p.deviceName.isBlank() || p.deviceFp != Build.FINGERPRINT) {
+        if (p.deviceName.isBlank() || p.deviceFp != Build.FINGERPRINT + "#2") {
             p.deviceName = resolve(ctx)
-            p.deviceFp = Build.FINGERPRINT
+            p.deviceFp = Build.FINGERPRINT + "#2"
             CamLog.add("device: ${p.deviceName} (model=${Build.MODEL})")
         }
         return p.deviceName
@@ -118,8 +125,8 @@ object Watermark {
         ExifInterface.TAG_GPS_TIMESTAMP, ExifInterface.TAG_GPS_DATESTAMP, ExifInterface.TAG_GPS_PROCESSING_METHOD
     )
 
-    /** Menggambar teks ke piksel foto (sudah diputar tegak) lalu mengembalikan JPEG baru. */
-    fun apply(src: ByteArray, text: String, pos: Int, quality: Int): ByteArray {
+    /** Decode JPEG, putar sesuai EXIF sehingga tegak, dan kembalikan bitmap yang bisa digambar. */
+    fun loadUpright(src: ByteArray): Bitmap {
         val exif = ExifInterface(ByteArrayInputStream(src))
         val ori = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
 
@@ -153,7 +160,10 @@ object Watermark {
             bmp.recycle()
             bmp = c
         }
+        return bmp
+    }
 
+    fun draw(bmp: Bitmap, text: String, pos: Int) {
         val w = bmp.width
         val h = bmp.height
         val shortSide = min(w, h).toFloat()
@@ -171,10 +181,11 @@ object Watermark {
             else -> { paint.textAlign = Paint.Align.LEFT; x = margin }
         }
         Canvas(bmp).drawText(text, x, h - margin, paint)
+    }
 
-        val out = ByteArrayOutputStream(src.size + 65536)
+    fun encode(bmp: Bitmap, quality: Int): ByteArray {
+        val out = ByteArrayOutputStream(bmp.width * bmp.height / 4)
         bmp.compress(Bitmap.CompressFormat.JPEG, quality, out)
-        bmp.recycle()
         return out.toByteArray()
     }
 

@@ -245,7 +245,7 @@ class SettingsActivity : Activity() {
         )
 
         section("Tentang")
-        card(infoRow("Camera 1.1", "SenzaProject"))
+        card(infoRow("Camera 1.2", "SenzaProject"))
     }
 
     private fun editWatermark(done: () -> Unit) {

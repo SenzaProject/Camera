@@ -105,6 +105,12 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     private var lastExp = 16_000_000L
     private var attempt = 0
     private var gen = 0
+    private var closing: CameraCaptureSession? = null
+    private var configuring = false
+    private var pendingNext: (() -> Unit)? = null
+    private var jpegW = 0
+    private var jpegH = 0
+    private val shotModes = java.util.concurrent.ConcurrentLinkedQueue<Mode>()
     private var videoHeight = 1080
     private var videoFps = 30
     private var videoEis = false
@@ -123,9 +129,8 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     fun detachSurface(st: SurfaceTexture) {
         handler.post {
-            closeSession()
             if (surfaceTexture === st) surfaceTexture = null
-            try { st.release() } catch (_: Exception) {}
+            closeSessionAsync { try { st.release() } catch (_: Exception) {} }
         }
     }
 
@@ -373,10 +378,42 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         }
     }
 
-    private fun closeSession() {
+    /**
+     * Menutup sesi lama dan MENUNGGU onClosed sebelum membuat sesi baru. Tanpa menunggu,
+     * stream lama masih terhubung ke SurfaceTexture yang sama sehingga sesi baru gagal (onConfigureFailed).
+     */
+    private fun closeSessionAsync(next: () -> Unit) {
         gen++
-        try { session?.close() } catch (_: Exception) {}
+        val old = session
         session = null
+        if (old != null) {
+            closing = old
+            try { old.close() } catch (_: Exception) {}
+            handler.postDelayed({ if (closing === old) onSessionClosed(old) }, 800)
+        }
+        if (closing != null || configuring) {
+            pendingNext = next
+            return
+        }
+        cleanupOutputs()
+        next()
+    }
+
+    private fun runPending() {
+        if (closing != null || configuring) return
+        cleanupOutputs()
+        val n = pendingNext
+        pendingNext = null
+        n?.invoke()
+    }
+
+    private fun onSessionClosed(s: CameraCaptureSession) {
+        if (closing !== s) return
+        closing = null
+        runPending()
+    }
+
+    private fun cleanupOutputs() {
         try { reader?.close() } catch (_: Exception) {}
         reader = null
         discardRecorder()
@@ -385,7 +422,13 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     private fun closeInternal() {
         if (recording) stopRecordingInternal()
-        closeSession()
+        gen++
+        pendingNext = null
+        closing = null
+        configuring = false
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        cleanupOutputs()
         try { device?.close() } catch (_: Exception) {}
         device = null
     }
@@ -417,11 +460,15 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     }
 
     private fun configure() {
+        if (device == null || surfaceTexture == null || chars == null) return
+        if (recording) return
+        closeSessionAsync { doConfigure() }
+    }
+
+    private fun doConfigure() {
         val dev = device ?: return
         val st = surfaceTexture ?: return
         val ch = chars ?: return
-        if (recording) return
-        closeSession()
         val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
         fpsWindowStart = 0L
         fpsFrames = 0
@@ -439,6 +486,8 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         val jpeg = if (mode == Mode.HIRES && attempt == 0 && jpegSizes != null && jpegSizes.isNotEmpty())
             jpegSizes.maxByOrNull { it.width.toLong() * it.height }!!
         else pickSize(jpegSizes, wantRatio, jpegCap)
+        jpegW = jpeg.width
+        jpegH = jpeg.height
         val ratio = jpeg.width.toFloat() / jpeg.height
         val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), ratio, if (attempt >= 2) 1_300_000L else 2_100_000L)
         CamLog.add("foto ${mode.name} attempt=$attempt jpeg=${jpeg.width}x${jpeg.height} preview=${prev.width}x${prev.height}")
@@ -593,23 +642,61 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         val outs = surfaces.map { OutputConfiguration(it) }
         val stateCallback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
+                configuring = false
                 if (myGen != gen || device == null) {
+                    // Sesi usang: tutup dulu, lalu lanjutkan konfigurasi yang menunggu
+                    closing = s
                     try { s.close() } catch (_: Exception) {}
+                    handler.postDelayed({ if (closing === s) onSessionClosed(s) }, 800)
                     return
                 }
                 session = s
                 CamLog.add("sesi siap (${mode.name}, attempt=$attempt)")
                 startRepeating(true)
+                announceMode()
+            }
+
+            override fun onClosed(s: CameraCaptureSession) {
+                onSessionClosed(s)
             }
 
             override fun onConfigureFailed(s: CameraCaptureSession) {
-                if (myGen != gen) return
+                configuring = false
+                if (myGen != gen) {
+                    runPending()
+                    return
+                }
                 onSessionFailed("onConfigureFailed")
             }
         }
         val sc = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, executor, stateCallback)
         if (useParams) sc.sessionParameters = b.build()
-        dev.createCaptureSession(sc)
+        configuring = true
+        try {
+            dev.createCaptureSession(sc)
+        } catch (e: Exception) {
+            configuring = false
+            throw e
+        }
+    }
+
+    private fun announceMode() {
+        if (attempt >= 1) return
+        when (mode) {
+            Mode.PORTRAIT -> msg("Potret: blur latar diterapkan setelah foto (wajah harus terlihat)")
+            Mode.NIGHT -> msg(
+                if (has(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES, CaptureRequest.CONTROL_SCENE_MODE_NIGHT))
+                    "Super Malam: scene malam aktif" else "Super Malam: exposure dinaikkan (perangkat tanpa scene malam)"
+            )
+            Mode.MACRO -> msg(
+                if (has(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES, CaptureRequest.CONTROL_AF_MODE_MACRO))
+                    "Super Makro: fokus dekat aktif" else "Perangkat tanpa mode makro, memakai fokus biasa"
+            )
+            Mode.HIRES -> msg("Piksel Tinggi: $jpegW×$jpegH (${(jpegW.toLong() * jpegH / 1_000_000L)} MP)")
+            Mode.PRO -> if (chars?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(
+                    CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) != true) msg("Perangkat tidak mendukung kontrol manual penuh")
+            else -> {}
+        }
     }
 
     private fun onSessionFailed(reason: String) {
@@ -708,6 +795,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
                     if (flash == 2) CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH else CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
             }
             if (prefs.shutterSound) sound.play(MediaActionSound.SHUTTER_CLICK)
+            shotModes.add(mode)
             s.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
                     msg("Gagal mengambil foto")
@@ -733,15 +821,30 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     private fun savePhoto(raw: ByteArray) {
         try {
+            val shotMode = shotModes.poll() ?: Mode.AI_CAM
             var bytes = raw
-            var marked = false
-            if (prefs.watermark) {
+            var processed = false
+            val wantPortrait = shotMode == Mode.PORTRAIT
+            if (wantPortrait || prefs.watermark) {
                 try {
-                    bytes = Watermark.apply(raw, Watermark.text(ctx, prefs), prefs.wmPos, prefs.jpegQuality)
-                    marked = true
+                    val bmp = Watermark.loadUpright(raw)
+                    var changed = false
+                    if (wantPortrait) {
+                        if (Portrait.apply(bmp)) changed = true
+                        else msg("Wajah tidak terdeteksi, efek potret tidak diterapkan")
+                    }
+                    if (prefs.watermark) {
+                        Watermark.draw(bmp, Watermark.text(ctx, prefs), prefs.wmPos)
+                        changed = true
+                    }
+                    if (changed) {
+                        bytes = Watermark.encode(bmp, prefs.jpegQuality)
+                        processed = true
+                    }
+                    bmp.recycle()
                 } catch (t: Throwable) {
-                    CamLog.add("watermark gagal: ${t.javaClass.simpleName} ${t.message}")
-                    msg("Watermark gagal, foto disimpan tanpa watermark")
+                    CamLog.add("olah foto gagal: ${t.javaClass.simpleName} ${t.message}")
+                    msg("Pengolahan foto gagal, disimpan apa adanya")
                 }
             }
             val resolver = ctx.contentResolver
@@ -753,7 +856,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             }
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
             resolver.openOutputStream(uri)?.use { it.write(bytes) }
-            if (marked) {
+            if (processed) {
                 try {
                     resolver.openFileDescriptor(uri, "rw")?.use { Watermark.copyExif(raw, it.fileDescriptor) }
                 } catch (e: Exception) {

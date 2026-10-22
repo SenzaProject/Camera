@@ -19,3 +19,9 @@ git push -u origin main
 - Perbaikan sesi kamera (callback sesi lama tidak lagi dianggap gagal; fallback bertahap bila perangkat menolak konfigurasi)
 - Watermark nama perangkat (Pengaturan → Watermark, atau ikon di baris opsi di bawah chevron)
 - Log kamera di Pengaturan untuk diagnosis
+
+## v1.2
+- Akar bug ganti mode: sesi baru dibuat sebelum sesi lama benar-benar tertutup (onConfigureFailed). Sekarang menunggu onClosed dan menangani ganti mode beruntun
+- Mode Potret: blur latar berbasis deteksi wajah (diterapkan setelah foto), bukan bokeh kedalaman
+- Pesan penjelas tiap mode (apakah fitur didukung perangkat atau tidak)
+- Nama watermark tidak lagi ditempeli merek dari Build.MANUFACTURER (ROM bisa memalsukannya)
