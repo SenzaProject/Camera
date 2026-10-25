@@ -90,6 +90,29 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     private lateinit var msgPill: TextView
     private lateinit var proPanel: LinearLayout
     private var moreOverlay: FrameLayout? = null
+    private lateinit var dual: DualCamera
+    private lateinit var focusView: FocusView
+    private lateinit var faceOverlay: FaceOverlay
+    private lateinit var stabBtn: IconView
+    private lateinit var swapBtn: IconView
+    private lateinit var layoutBtn: IconView
+    private var currentSt: SurfaceTexture? = null
+    private var viewMirror = false
+    private var extraZ = 1f
+    private var evNorm = 0f
+    private var proWb: TextView? = null
+    private var wbIdx = 0
+    private val wbNames = arrayOf("Auto", "Pijar", "Neon", "Siang", "Mendung")
+    private val wbModes = intArrayOf(1, 2, 3, 5, 6)
+    private val hideFocus = Runnable { focusView.active = false }
+    private val backdropTick = object : Runnable {
+        override fun run() {
+            if (prefs.glass) {
+                Backdrop.update(texture)
+                ui.postDelayed(this, 200)
+            }
+        }
+    }
 
     private val optRefresh = ArrayList<() -> Unit>()
     private val modeViews = ArrayList<TextView>()
@@ -115,7 +138,9 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         prefs = Prefs(this)
         CamLog.init(prefs)
         ctrl = CameraController(this, prefs, this)
+        dual = DualCamera(this, prefs, this)
         mode = try { Mode.valueOf(prefs.lastMode) } catch (_: Exception) { Mode.AI_CAM }
+        if (mode == Mode.DUAL) mode = Mode.VIDEO
         if (mode !in carousel) moreMode = mode
         buildUi()
         setContentView(root)
@@ -151,15 +176,26 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
             val acc = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             if (acc != null) sensorManager?.registerListener(this, acc, SensorManager.SENSOR_DELAY_UI)
         }
+        Backdrop.enabled = prefs.glass
+        ui.removeCallbacks(backdropTick)
+        if (prefs.glass) ui.postDelayed(backdropTick, 500)
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            texture.scaleX = if (front) -1f else 1f
-            ctrl.setMode(mode)
-            ctrl.open(front)
+            startActive()
             loadThumb()
         } else {
             requestPermissions(arrayOf(
                 Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO), 1)
+        }
+    }
+
+    private fun startActive() {
+        if (mode == Mode.DUAL) {
+            val st = currentSt
+            if (st != null) dual.start(st)
+        } else {
+            ctrl.setMode(mode)
+            ctrl.open(front)
         }
     }
 
@@ -170,19 +206,20 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         ui.removeCallbacksAndMessages(null)
         counting = false
         countdown.visibility = View.GONE
+        dual.release()
         ctrl.release()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        dual.destroy()
         ctrl.destroy()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            ctrl.setMode(mode)
-            ctrl.open(front)
+            startActive()
             loadThumb()
         } else {
             showMsg("Izin kamera diperlukan")
@@ -197,7 +234,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
                 1 -> {
                     val c = caps
                     val step = if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) 0.3f else -0.3f
-                    zoom = (zoom + step).coerceIn(c?.zoomMin ?: 1f, c?.zoomMax ?: 1f)
+                    zoom = (zoom + step).coerceIn(c?.zoomMin ?: 1f, zoomMaxNow())
                     ctrl.setZoom(zoom); updateZoomUi()
                     return true
                 }
@@ -217,9 +254,9 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
             includeFontPadding = false
         }
 
-    private fun iconBtn(ic: Ic, size: Float = 44f, click: () -> Unit): IconView {
+    private fun iconBtn(ic: Ic, size: Float = 44f, backdrop: Boolean = true, click: () -> Unit): IconView {
         val v = IconView(this, ic)
-        v.background = GlassDrawable(this)
+        v.background = GlassDrawable(this, -1f, 0x59303034, backdrop)
         val p = dp(size * 0.27f)
         v.setPadding(p, p, p, p)
         v.setOnClickListener { click() }
@@ -233,11 +270,23 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         // ---- pratinjau
         previewFrame = FrameLayout(this)
         previewFrame.clipChildren = true
+        Backdrop.frame = previewFrame
+        Backdrop.enabled = prefs.glass
         texture = TextureView(this)
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) { ctrl.setSurface(st) }
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) { ctrl.refreshBufferSize(st) }
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { ctrl.detachSurface(st); return false }
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                currentSt = st
+                if (mode == Mode.DUAL) dual.start(st) else ctrl.setSurface(st)
+            }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
+                if (mode != Mode.DUAL) ctrl.refreshBufferSize(st)
+            }
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                if (currentSt === st) currentSt = null
+                if (mode == Mode.DUAL) dual.release { try { st.release() } catch (_: Exception) {} }
+                else ctrl.detachSurface(st)
+                return false
+            }
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
         previewFrame.addView(texture, FrameLayout.LayoutParams(-1, -1))
@@ -245,6 +294,10 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         previewFrame.addView(grid, FrameLayout.LayoutParams(-1, -1))
         level = LevelOverlay(this)
         previewFrame.addView(level, FrameLayout.LayoutParams(-1, -1))
+        faceOverlay = FaceOverlay(this)
+        previewFrame.addView(faceOverlay, FrameLayout.LayoutParams(-1, -1))
+        focusView = FocusView(this)
+        previewFrame.addView(focusView, FrameLayout.LayoutParams(-1, -1))
         focusBox = View(this)
         focusBox.background = GradientDrawable().apply {
             setColor(Color.TRANSPARENT); setStroke(dp(2f), C.YELLOW); cornerRadius = dpf(6f)
@@ -285,8 +338,17 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         infoPill.background = GlassDrawable(this)
         infoPill.visibility = View.GONE
         infoPill.setOnClickListener { toggleUnlock() }
-        right.addView(iconBtn(Ic.GEAR) { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) },
-            LinearLayout.LayoutParams(dp(44f), dp(44f)))
+        swapBtn = iconBtn(Ic.SWAP, 40f) { swapDual() }
+        layoutBtn = iconBtn(Ic.LAYOUT, 40f) { toggleDualLayout() }
+        stabBtn = iconBtn(Ic.STAB, 40f) { toggleStab() }
+        swapBtn.visibility = View.GONE
+        layoutBtn.visibility = View.GONE
+        stabBtn.visibility = View.GONE
+        right.addView(swapBtn, LinearLayout.LayoutParams(dp(40f), dp(40f)).apply { rightMargin = dp(6f) })
+        right.addView(layoutBtn, LinearLayout.LayoutParams(dp(40f), dp(40f)).apply { rightMargin = dp(6f) })
+        right.addView(stabBtn, LinearLayout.LayoutParams(dp(40f), dp(40f)).apply { rightMargin = dp(6f) })
+        right.addView(iconBtn(Ic.GEAR, 40f) { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) },
+            LinearLayout.LayoutParams(dp(40f), dp(40f)))
         topBar.addView(right, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(16f) })
         root.addView(topBar, FrameLayout.LayoutParams(-1, dp(56f), Gravity.TOP))
         root.addView(infoPill, FrameLayout.LayoutParams(-2, dp(30f), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
@@ -303,7 +365,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         optionsRow.orientation = LinearLayout.HORIZONTAL
         optionsRow.gravity = Gravity.CENTER
         optionsRow.background = GlassDrawable(this, dpf(28f))
-        optionsRow.setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
+        optionsRow.setPadding(dp(8f), dp(8f), dp(8f), dp(8f))
         optionsRow.visibility = View.GONE
         optionsRow.addView(optCell(Ic.TIMER, { when (prefs.timer) { 3 -> "3 dtk"; 10 -> "10 dtk"; else -> "Mati" } }) { cycleTimer() }.first)
         val ratio = optCell(Ic.RATIO, { if (prefs.photoRatio == 1) "16:9" else "4:3" }) {
@@ -329,6 +391,8 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         optionsRow.addView(optCell(Ic.WATERMARK, { if (prefs.watermark) "Aktif" else "Mati" }) {
             prefs.watermark = !prefs.watermark
         }.first)
+        optionsRow.addView(optCell(Ic.BEAUTY, { Beauty.name(prefs.beauty) }) { cycleBeauty() }.first)
+        optionsRow.addView(optCell(Ic.FACE, { if (prefs.faceDetect || mode == Mode.FACE) "Aktif" else "Mati" }) { toggleFace() }.first)
         root.addView(optionsRow, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
 
         // ---- panel bawah
@@ -348,7 +412,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         zoomRow = LinearLayout(this)
         zoomRow.orientation = LinearLayout.HORIZONTAL
         zoomRow.gravity = Gravity.CENTER
-        zoomRow.background = GlassDrawable(this)
+        zoomRow.background = GlassDrawable(this, -1f, 0x59303034, false)
         zoomRow.setPadding(dp(4f), dp(4f), dp(4f), dp(4f))
         bottomPanel.addView(zoomRow, LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(10f) })
 
@@ -384,7 +448,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         shutter = ShutterView(this)
         shutter.setOnClickListener { onShutter() }
         shutterRow.addView(shutter, FrameLayout.LayoutParams(dp(78f), dp(78f), Gravity.CENTER))
-        shutterRow.addView(iconBtn(Ic.FLIP, 54f) { flipCamera() },
+        shutterRow.addView(iconBtn(Ic.FLIP, 54f, false) { flipCamera() },
             FrameLayout.LayoutParams(dp(54f), dp(54f), Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(34f) })
         bottomPanel.addView(shutterRow, LinearLayout.LayoutParams(-1, dp(92f)))
         root.addView(bottomPanel, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
@@ -438,7 +502,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         val cell = LinearLayout(this)
         cell.orientation = LinearLayout.VERTICAL
         cell.gravity = Gravity.CENTER
-        cell.setPadding(dp(10f), dp(2f), dp(10f), dp(2f))
+        cell.setPadding(dp(6f), dp(2f), dp(6f), dp(2f))
         val icon = IconView(this, ic)
         cell.addView(icon, LinearLayout.LayoutParams(dp(28f), dp(28f)))
         val cap = tv(caption(), 10f, 0xCCFFFFFF.toInt())
@@ -501,19 +565,27 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
 
     // --------------------------------------------------------- zoom & mode
 
+    private fun zoomMaxNow(): Float {
+        val c = caps ?: return 1f
+        return if (mode.video) c.halZoomMax else c.zoomMax
+    }
+
     private fun rebuildZoom() {
         zoomRow.removeAllViews()
         val c = caps
         val presets = ArrayList<Float>()
         if (c != null && c.zoomMin <= 0.6f) presets.add(0.5f)
         presets.add(1f)
-        if (c == null || c.zoomMax >= 2f) presets.add(2f)
+        val mx = zoomMaxNow()
+        if (c == null || mx >= 2f) presets.add(2f)
+        if (c != null && mx >= 5f) presets.add(5f)
+        if (c != null && mx >= 12f) presets.add(12f)
         for (p in presets) {
             val t = tv("", 13f, Color.WHITE, true)
             t.gravity = Gravity.CENTER
             t.tag = p
             t.setOnClickListener { zoom = p; ctrl.setZoom(p); updateZoomUi() }
-            zoomRow.addView(t, LinearLayout.LayoutParams(dp(40f), dp(40f)).apply { leftMargin = dp(2f); rightMargin = dp(2f) })
+            zoomRow.addView(t, LinearLayout.LayoutParams(dp(38f), dp(38f)).apply { leftMargin = dp(1f); rightMargin = dp(1f) })
         }
         updateZoomUi()
     }
@@ -575,13 +647,73 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
 
     private fun selectMode(m: Mode, fromCarousel: Boolean) {
         if (recording || counting) return
+        val wasDual = mode == Mode.DUAL
         if (fromCarousel) moreMode = null else moreMode = m
         mode = m
-        prefs.lastMode = m.name
+        if (m != Mode.DUAL) prefs.lastMode = m.name
+        evNorm = 0f
+        focusView.active = false
+        faceOverlay.faces = emptyList()
         refreshModeLabels()
         centerSelected()
         updateModeUi()
-        ctrl.setMode(m)
+        when {
+            m == Mode.DUAL -> enterDual()
+            wasDual -> leaveDual(m)
+            else -> ctrl.setMode(m)
+        }
+    }
+
+    private fun enterDual() {
+        showMsg("Membuka dua kamera…")
+        ctrl.release {
+            val st = currentSt
+            if (st != null) dual.start(st)
+        }
+    }
+
+    private fun leaveDual(m: Mode) {
+        dual.release {
+            val st = currentSt
+            if (st != null) ctrl.setSurface(st)
+            ctrl.setMode(m)
+            ctrl.open(front)
+        }
+    }
+
+    private fun swapDual() {
+        prefs.dualSwap = !prefs.dualSwap
+        dual.setLayout(prefs.dualLayout, prefs.dualSwap)
+    }
+
+    private fun toggleDualLayout() {
+        prefs.dualLayout = 1 - prefs.dualLayout
+        dual.setLayout(prefs.dualLayout, prefs.dualSwap)
+    }
+
+    private fun toggleStab() {
+        prefs.eis = !prefs.eis
+        updateStabIcon()
+        showMsg(if (prefs.eis) "Peredam guncangan: AKTIF" else "Peredam guncangan: MATI")
+        if (mode == Mode.DUAL) dual.reconfigure() else ctrl.reconfigure()
+    }
+
+    private fun updateStabIcon() {
+        stabBtn.color = if (prefs.eis) C.YELLOW else Color.WHITE
+        stabBtn.label = if (prefs.eis) "" else "off"
+        stabBtn.invalidate()
+    }
+
+    private fun cycleBeauty() {
+        prefs.beauty = (prefs.beauty + 1) % Beauty.NAMES.size
+        ctrl.onBeautyChanged()
+        showMsg("Beauty: " + Beauty.name(prefs.beauty) + if (mode == Mode.DUAL && prefs.beauty > 0) " (belum untuk video ganda)" else "")
+    }
+
+    private fun toggleFace() {
+        prefs.faceDetect = !prefs.faceDetect
+        ctrl.updateFaces()
+        if (!prefs.faceDetect && mode != Mode.FACE) faceOverlay.faces = emptyList()
     }
 
     private fun stepMode(dir: Int) {
@@ -597,10 +729,18 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     }
 
     private fun updateModeUi() {
+        val isDual = mode == Mode.DUAL
         shutter.video = mode.video
-        infoPill.visibility = if (mode == Mode.VLOG || mode == Mode.VIDEO) View.VISIBLE else View.GONE
+        infoPill.visibility = if (mode == Mode.VLOG || mode == Mode.VIDEO || isDual) View.VISIBLE else View.GONE
         proPanel.visibility = if (mode == Mode.PRO) View.VISIBLE else View.GONE
+        stabBtn.visibility = if (mode.video && !isDual) View.VISIBLE else View.GONE
+        swapBtn.visibility = if (isDual) View.VISIBLE else View.GONE
+        layoutBtn.visibility = if (isDual) View.VISIBLE else View.GONE
+        flashBtn.visibility = if (isDual) View.INVISIBLE else View.VISIBLE
+        zoomRow.visibility = if (isDual) View.GONE else View.VISIBLE
+        updateStabIcon()
         if (mode != Mode.PRO) resetPro()
+        if (caps != null) rebuildZoom()
         refreshOptions()
     }
 
@@ -610,6 +750,8 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         proIso?.progress = 0
         proExp?.progress = 0
         proFocus?.progress = 0
+        wbIdx = 0
+        proWb?.text = wbNames[0]
         if (proValues.size >= 4) updateProLabels()
     }
 
@@ -619,16 +761,16 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         var ov = moreOverlay
         if (ov == null) {
             ov = FrameLayout(this)
-            ov.setBackgroundColor(0xF2000000.toInt())
+            ov.background = GlassDrawable(this, 0f, 0xE6000000.toInt())
             ov.isClickable = true
             val col = LinearLayout(this)
             col.orientation = LinearLayout.VERTICAL
             col.gravity = Gravity.CENTER
             val items = listOf(
-                Triple("PANORAMA", Ic.PANO, null as Mode?), Triple("PRO", Ic.PRO, Mode.PRO), Triple("SKY SHOP", Ic.SKY, null as Mode?),
+                Triple("PANORAMA", Ic.PANO, null as Mode?), Triple("MANUAL", Ic.PRO, Mode.PRO), Triple("SKY SHOP", Ic.SKY, null as Mode?),
                 Triple("DOKUMEN", Ic.DOC, null as Mode?), Triple("SUPER MAKRO", Ic.MACRO, Mode.MACRO), Triple("GERAK LAMBAT", Ic.SLOWMO, null as Mode?),
-                Triple("SELANG WAKTU", Ic.TIMELAPSE, Mode.TIMELAPSE), Triple("VIDEO GANDA", Ic.DUAL, null as Mode?), Triple("POTRET AIGC", Ic.AIGC, null as Mode?),
-                Triple("PIKSEL TINGGI", Ic.HD, Mode.HIRES)
+                Triple("SELANG WAKTU", Ic.TIMELAPSE, Mode.TIMELAPSE), Triple("VIDEO GANDA", Ic.DUAL, Mode.DUAL), Triple("POTRET AIGC", Ic.AIGC, null as Mode?),
+                Triple("PIKSEL TINGGI", Ic.HD, Mode.HIRES), Triple("DETEKSI WAJAH", Ic.FACE, Mode.FACE)
             )
             var row: LinearLayout? = null
             for ((i, it) in items.withIndex()) {
@@ -648,7 +790,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
                 cell.alpha = if (target != null) 1f else 0.35f
                 cell.setOnClickListener {
                     if (target != null) { hideMore(); selectMode(target, false) }
-                    else showMsg("Belum tersedia di versi 1.0")
+                    else showMsg("Belum tersedia di versi 1.0 Beta")
                 }
                 row!!.addView(cell, LinearLayout.LayoutParams(0, -2, 1f))
             }
@@ -677,6 +819,22 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         proIso = proRow("ISO")
         proExp = proRow("S")
         proFocus = proRow("AF")
+        val wbRow = LinearLayout(this)
+        wbRow.orientation = LinearLayout.HORIZONTAL
+        wbRow.gravity = Gravity.CENTER_VERTICAL
+        wbRow.addView(tv("WB", 12f, Color.WHITE, true), LinearLayout.LayoutParams(dp(30f), -2))
+        val chip = tv("Auto", 12f, C.YELLOW, true)
+        chip.gravity = Gravity.CENTER
+        chip.setPadding(dp(14f), dp(6f), dp(14f), dp(6f))
+        chip.background = GlassDrawable(this, -1f, 0x59303034, false)
+        chip.setOnClickListener {
+            wbIdx = (wbIdx + 1) % wbNames.size
+            chip.text = wbNames[wbIdx]
+            ctrl.setAwb(wbModes[wbIdx])
+        }
+        proWb = chip
+        wbRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(2f); bottomMargin = dp(2f) })
+        proPanel.addView(wbRow)
         val l = object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { if (fromUser) applyPro() else updateProLabels() }
             override fun onStartTrackingTouch(s: SeekBar) {}
@@ -762,7 +920,8 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(d: ScaleGestureDetector): Boolean {
                 val c = caps ?: return true
-                zoom = (zoom * d.scaleFactor).coerceIn(c.zoomMin, c.zoomMax)
+                if (mode == Mode.DUAL) return true
+                zoom = (zoom * d.scaleFactor).coerceIn(c.zoomMin, zoomMaxNow())
                 ctrl.setZoom(zoom)
                 updateZoomUi()
                 return true
@@ -771,6 +930,7 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onSingleTapUp(e: MotionEvent): Boolean {
+                if (mode == Mode.DUAL) return true
                 val w = previewFrame.width.toFloat(); val h = previewFrame.height.toFloat()
                 if (w > 0 && h > 0) {
                     ctrl.focusAt(e.x / w, e.y / h)
@@ -782,7 +942,20 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
         var downX = 0f
         var downY = 0f
         var multi = false
+        var dragEv = false
         previewFrame.setOnTouchListener { _, e ->
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) dragEv = focusView.hitSlider(e.x, e.y)
+            if (dragEv) {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> setEvNorm(focusView.evFromY(e.y))
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        dragEv = false
+                        ui.removeCallbacks(hideFocus)
+                        ui.postDelayed(hideFocus, 2500)
+                    }
+                }
+                return@setOnTouchListener true
+            }
             scaleDetector.onTouchEvent(e)
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> { downX = e.x; downY = e.y; multi = false }
@@ -802,25 +975,29 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     }
 
     private fun showFocus(x: Float, y: Float) {
-        val s = dp(72f)
-        focusBox.translationX = x - s / 2f
-        focusBox.translationY = y - s / 2f
-        focusBox.visibility = View.VISIBLE
-        focusBox.alpha = 1f
-        focusBox.scaleX = 1.4f
-        focusBox.scaleY = 1.4f
-        focusBox.animate().scaleX(1f).scaleY(1f).setDuration(180).withEndAction {
-            focusBox.animate().alpha(0f).setStartDelay(900).setDuration(250).withEndAction {
-                focusBox.visibility = View.GONE
-            }.start()
-        }.start()
+        focusView.cx = x
+        focusView.cy = y
+        focusView.ev = evNorm
+        focusView.active = true
+        ui.removeCallbacks(hideFocus)
+        ui.postDelayed(hideFocus, 3500)
+    }
+
+    private fun setEvNorm(n: Float) {
+        evNorm = n
+        focusView.ev = n
+        ui.removeCallbacks(hideFocus)
+        val c = caps ?: return
+        val idx = if (n >= 0f) (n * c.evMax).roundToInt() else (n * -c.evMin).roundToInt()
+        ctrl.setEv(idx)
+        proEv?.progress = (idx - c.evMin).coerceAtLeast(0)
     }
 
     // -------------------------------------------------------- rana / video
 
     private fun onShutter() {
         if (counting) return
-        if (recording) { ctrl.stopRecording(); return }
+        if (recording) { if (mode == Mode.DUAL) dual.stopRecording() else ctrl.stopRecording(); return }
         val t = prefs.timer
         if (t > 0) startCountdown(t) else doShutter()
     }
@@ -847,7 +1024,9 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     }
 
     private fun doShutter() {
-        if (mode.video) {
+        if (mode == Mode.DUAL) {
+            dual.startRecording()
+        } else if (mode.video) {
             ctrl.startRecording()
         } else {
             ctrl.capturePhoto()
@@ -859,8 +1038,8 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
 
     private fun flipCamera() {
         if (recording || counting) return
+        if (mode == Mode.DUAL) { swapDual(); return }
         front = !front
-        texture.scaleX = if (front) -1f else 1f
         zoom = 1f
         ctrl.open(front)
         updateZoomUi()
@@ -903,10 +1082,35 @@ class MainActivity : Activity(), CameraController.Callback, SensorEventListener 
     }
 
     override fun onMessage(msg: String) { showMsg(msg) }
+    override fun onFaces(rects: List<android.graphics.RectF>) { faceOverlay.faces = rects }
+
+    override fun onZoom(z: Float, extra: Float) {
+        zoom = z
+        extraZ = extra
+        updateZoomUi()
+        applyTextureScale()
+    }
+
+    override fun onViewMirror(on: Boolean) {
+        viewMirror = on
+        applyTextureScale()
+    }
+
+    private fun applyTextureScale() {
+        texture.scaleX = (if (viewMirror) -1f else 1f) * extraZ
+        texture.scaleY = extraZ
+        Backdrop.mirror = viewMirror
+    }
+
+    override fun onDualFailed(reason: String) {
+        showMsg("Video ganda tidak bisa dipakai: $reason")
+        if (mode == Mode.DUAL) ui.postDelayed({ selectMode(Mode.VIDEO, true) }, 300)
+    }
 
     override fun onVideoStatus(height: Int, fps: Int, eis: Boolean, measured: Boolean) {
         val res = if (height >= 2160) "4K" else height.toString()
-        infoPill.text = res + " · " + fps + if (eis) " · EIS" else ""
+        val tag = if (!eis) "" else if (mode != Mode.DUAL && ctrl.stabKind == 2) " · EIS+" else " · EIS"
+        infoPill.text = res + " · " + fps + tag
         infoPill.setTextColor(
             if (measured && eis && fps >= 55) C.YELLOW
             else if (measured) Color.WHITE

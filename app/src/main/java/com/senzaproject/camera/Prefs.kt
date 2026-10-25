@@ -52,4 +52,12 @@ class Prefs(context: Context) {
     var deviceName by str("device_name", "")
     var deviceFp by str("device_fp", "")
     var log by str("log", "")
+    var faceDetect by bool("face_detect", false)
+    var beauty by int("beauty", 0)                // 0 mati, 1 alami, 2 halus, 3 cerah, 4 maks
+    var glass by bool("glass", true)
+    var dualLayout by int("dual_layout", 0)       // 0 atas-bawah, 1 gambar-dalam-gambar
+    var dualSwap by bool("dual_swap", false)
+    var mirrorFront by bool("mirror_front", true)
+    var stabGyro by bool("stab_gyro", true)       // EIS Plus berbasis gyroscope
+    var stabLevel by int("stab_level", 1)         // 0 ringan, 1 normal, 2 kuat
 }

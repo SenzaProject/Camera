@@ -11,8 +11,8 @@ android {
         applicationId = "com.senzaproject.camera"
         minSdk = 34
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.0 Beta"
     }
 
     signingConfigs {

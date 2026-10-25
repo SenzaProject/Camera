@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
@@ -42,17 +43,20 @@ enum class Mode(val label: String, val video: Boolean) {
     AI_CAM("AI CAM", false),
     PORTRAIT("POTRET", false),
     NIGHT("SUPER MALAM", false),
-    PRO("PRO", false),
+    PRO("MANUAL", false),
     MACRO("SUPER MAKRO", false),
     TIMELAPSE("SELANG WAKTU", true),
-    HIRES("PIKSEL TINGGI", false)
+    HIRES("PIKSEL TINGGI", false),
+    FACE("DETEKSI WAJAH", false),
+    DUAL("VIDEO GANDA", true)
 }
 
 data class Caps(
     val zoomMin: Float, val zoomMax: Float,
     val evMin: Int, val evMax: Int, val evStep: Float,
     val isoMin: Int, val isoMax: Int, val expMin: Long, val expMax: Long,
-    val focusMax: Float, val manual: Boolean, val hasFlash: Boolean
+    val focusMax: Float, val manual: Boolean, val hasFlash: Boolean,
+    val halZoomMax: Float = 1f
 )
 
 class CameraController(private val ctx: Context, private val prefs: Prefs, private val cb: Callback) {
@@ -64,6 +68,10 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         fun onMessage(msg: String)
         fun onVideoStatus(height: Int, fps: Int, eis: Boolean, measured: Boolean)
         fun onRecording(on: Boolean)
+        fun onFaces(rects: List<android.graphics.RectF>)
+        fun onZoom(z: Float, extra: Float)
+        fun onViewMirror(on: Boolean)
+        fun onDualFailed(reason: String)
     }
 
     @Volatile var orientation = 0
@@ -92,6 +100,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     private var pendingUri: Uri? = null
     private var pendingPfd: ParcelFileDescriptor? = null
     private var previewSize = Size(1440, 1080)
+    private var bufSize = Size(1440, 1080)
 
     private var front = false
     private var mode = Mode.AI_CAM
@@ -110,7 +119,19 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     private var pendingNext: (() -> Unit)? = null
     private var jpegW = 0
     private var jpegH = 0
-    private val shotModes = java.util.concurrent.ConcurrentLinkedQueue<Mode>()
+    private class Shot(val mode: Mode, val extra: Float)
+    private val shotModes = java.util.concurrent.ConcurrentLinkedQueue<Shot>()
+    private var halMin = 1f
+    private var halMax = 1f
+    private var extraZoom = 1f
+    private var awb = CaptureRequest.CONTROL_AWB_MODE_AUTO
+    private var pipeline: GlPipeline? = null
+    private var glOut = Size(1080, 1920)
+    private var glDisabled = false
+    private var faceTick = 0
+    private var lastFaceCount = 0
+    @Volatile var stabKind = 0          // 0 = mati, 1 = EIS bawaan (HAL), 2 = EIS Plus (gyro)
+        private set
     private var videoHeight = 1080
     private var videoFps = 30
     private var videoEis = false
@@ -137,7 +158,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     fun refreshBufferSize(st: SurfaceTexture) {
         handler.post {
             if (surfaceTexture === st) {
-                try { st.setDefaultBufferSize(previewSize.width, previewSize.height) } catch (_: Exception) {}
+                try { st.setDefaultBufferSize(bufSize.width, bufSize.height) } catch (_: Exception) {}
             }
         }
     }
@@ -149,6 +170,9 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             front = frontFacing
             attempt = 0
             zoom = 1f
+            extraZoom = 1f
+            glDisabled = false
+            main.post { cb.onZoom(1f, 1f) }
             CamLog.add("buka kamera ${if (frontFacing) "depan" else "belakang"}")
             try {
                 val id = pickCameraId(frontFacing)
@@ -167,9 +191,11 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     fun setMode(m: Mode) {
         handler.post {
-            if (m != Mode.PRO) { evIndex = 0; iso = 0; expNs = 0L; focus = -1f }
+            if (m != Mode.PRO) { evIndex = 0; iso = 0; expNs = 0L; focus = -1f; awb = CaptureRequest.CONTROL_AWB_MODE_AUTO }
             mode = m
             attempt = 0
+            glDisabled = false
+            applyUserZoom(zoom)
             if (device != null) configure()
         }
     }
@@ -183,9 +209,53 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     fun setZoom(z: Float) {
         handler.post {
-            zoom = clampZoom(z)
-            builder?.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
+            applyUserZoom(z)
+            builder?.set(CaptureRequest.CONTROL_ZOOM_RATIO, halZoom())
             startRepeating()
+        }
+    }
+
+    private fun userMaxZoom(): Float = if (mode.video) halMax else maxOf(halMax, 12f)
+
+    private fun halZoom(): Float = zoom.coerceIn(halMin, halMax)
+
+    /** Zoom pengguna bisa melebihi batas HAL: sisanya zoom digital (pratinjau di-scale, foto di-crop). */
+    private fun applyUserZoom(z: Float) {
+        zoom = z.coerceIn(halMin, userMaxZoom())
+        val hz = halZoom()
+        extraZoom = if (hz > 0f) zoom / hz else 1f
+        val zz = zoom
+        val ee = extraZoom
+        main.post { cb.onZoom(zz, ee) }
+    }
+
+    fun setAwb(m: Int) {
+        handler.post {
+            awb = m
+            builder?.let { applyCommon(it, mode.video) }
+            startRepeating()
+        }
+    }
+
+    private fun wantFaces(): Boolean = prefs.faceDetect || mode == Mode.FACE
+
+    fun updateFaces() {
+        handler.post {
+            builder?.let { applyCommon(it, mode.video) }
+            startRepeating()
+        }
+    }
+
+    fun onBeautyChanged() {
+        handler.post {
+            val pl = pipeline
+            if (mode.video && !recording) {
+                attempt = 0
+                if (device != null) configure()
+            } else if (pl != null) {
+                pl.beauty = Beauty.SMOOTH[prefs.beauty.coerceIn(0, 4)]
+                pl.bright = Beauty.BRIGHT[prefs.beauty.coerceIn(0, 4)]
+            }
         }
     }
 
@@ -223,9 +293,14 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             val r = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return@post
             var sx: Float
             var sy: Float
-            if (!front) { sx = v; sy = 1f - u } else { sx = 1f - v; sy = 1f - u }
-            sx = 0.5f + (sx - 0.5f) / zoom
-            sy = 0.5f + (sy - 0.5f) / zoom
+            val e = extraZoom
+            val u0 = 0.5f + (u - 0.5f) / e
+            val v0 = 0.5f + (v - 0.5f) / e
+            val mir = front && prefs.mirrorFront
+            if (!front) { sx = v0; sy = 1f - u0 } else { sx = 1f - v0; sy = if (mir) 1f - u0 else u0 }
+            val hz = halZoom()
+            sx = 0.5f + (sx - 0.5f) / hz
+            sy = 0.5f + (sy - 0.5f) / hz
             val cx = (r.left + sx * r.width()).toInt()
             val cy = (r.top + sy * r.height()).toInt()
             val half = (min(r.width(), r.height()) * 0.07f).toInt()
@@ -282,11 +357,13 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
                 return@post
             }
             try {
+                pipeline?.attachRecorder(r.surface, glOut.width, glOut.height)
                 r.start()
                 recording = true
                 if (prefs.shutterSound) sound.play(MediaActionSound.START_VIDEO_RECORDING)
                 main.post { cb.onRecording(true) }
             } catch (e: Exception) {
+                pipeline?.detachRecorder()
                 msg("Gagal mulai merekam: ${e.message}")
                 if (attempt < 2) {
                     attempt++
@@ -303,8 +380,11 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         }
     }
 
-    fun release() {
-        handler.post { closeInternal() }
+    fun release(done: (() -> Unit)? = null) {
+        handler.post {
+            closeInternal()
+            if (done != null) main.post(done)
+        }
     }
 
     fun destroy() {
@@ -349,13 +429,16 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         val capList = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList() ?: emptyList()
         val manual = capList.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) &&
             isoR != null && expR != null
+        halMin = z?.lower ?: 1f
+        halMax = z?.upper ?: 1f
         val caps = Caps(
-            z?.lower ?: 1f, z?.upper ?: 1f,
+            halMin, maxOf(halMax, 12f),
             ev?.lower ?: 0, ev?.upper ?: 0, step,
             isoR?.lower ?: 100, isoR?.upper ?: 100,
             expR?.lower ?: 1_000_000L, expR?.upper ?: 1_000_000L,
             minFocus, manual,
-            ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
+            halMax
         )
         main.post { cb.onCaps(caps) }
     }
@@ -417,6 +500,8 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         try { reader?.close() } catch (_: Exception) {}
         reader = null
         discardRecorder()
+        pipeline?.release()
+        pipeline = null
         builder = null
     }
 
@@ -492,7 +577,8 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), ratio, if (attempt >= 2) 1_300_000L else 2_100_000L)
         CamLog.add("foto ${mode.name} attempt=$attempt jpeg=${jpeg.width}x${jpeg.height} preview=${prev.width}x${prev.height}")
         previewSize = prev
-        main.post { cb.onPreviewSize(prev.width, prev.height) }
+        bufSize = prev
+        main.post { cb.onPreviewSize(prev.width, prev.height); cb.onViewMirror(front && prefs.mirrorFront) }
         st.setDefaultBufferSize(prev.width, prev.height)
         val ps = Surface(st)
         val rd = ImageReader.newInstance(jpeg.width, jpeg.height, ImageFormat.JPEG, 2)
@@ -510,12 +596,10 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         val unlock = prefs.unlockEis && !tl
         val h = if (tl) 1080 else if (unlock || mode == Mode.VLOG) 1080 else prefs.videoHeight
         var fps = if (tl) 30 else if (unlock) 60 else if (mode == Mode.VLOG) 30 else prefs.videoFps
-        var eis = !tl && (unlock || mode == Mode.VLOG || prefs.eis)
+        val stabWanted = !tl && prefs.eis
         if (attempt >= 1) fps = min(fps, 30)
-        if (attempt >= 2) eis = false
         videoHeight = h
         videoFps = fps
-        videoEis = eis
 
         val sizes = map.getOutputSizes(MediaRecorder::class.java)
         val list = sizes?.toList() ?: emptyList()
@@ -525,9 +609,19 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             ?: list.maxByOrNull { it.width.toLong() * it.height }
             ?: Size(1920, 1080)
 
+        // Jalur GL dipakai bila beauty video atau EIS Plus (gyro) aktif
+        val gyroWanted = !front && stabWanted && prefs.stabGyro
+        val wantGl = !tl && !glDisabled && attempt < 2 && h <= 1080 && (prefs.beauty > 0 || gyroWanted)
+        if (wantGl && tryGlVideo(dev, st, ch, vs, fps, unlock, stabWanted)) return
+
+        var eis = stabWanted
+        if (attempt >= 2) eis = false
+        videoEis = eis
+        stabKind = if (eis) 1 else 0
         val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), vs.width.toFloat() / vs.height, 2_100_000L)
         previewSize = prev
-        main.post { cb.onPreviewSize(prev.width, prev.height) }
+        bufSize = prev
+        main.post { cb.onPreviewSize(prev.width, prev.height); cb.onViewMirror(front && prefs.mirrorFront) }
         st.setDefaultBufferSize(prev.width, prev.height)
         val ps = Surface(st)
         val rs = prepareRecorder(vs, fps, tl)
@@ -538,11 +632,71 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         builder = b
         applyCommon(b, true)
         pickFpsRange(ch, fps, unlock && attempt == 0)?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
-        applyStabilization(b, eis, unlock && attempt == 0)
+        applyStabilization(b, eis, unlock && attempt == 0 && eis)
         val resLabel = vs.height
         CamLog.add("video ${mode.name} attempt=$attempt ${vs.width}x${vs.height}@$fps eis=$eis unlock=$unlock")
         main.post { cb.onVideoStatus(resLabel, fps, eis, false) }
         createSession(dev, listOf(ps, rs), b, attempt < 2)
+    }
+
+    /** Video lewat renderer GL (beauty dan/atau EIS Plus). false = GL gagal, lanjut ke jalur biasa. */
+    private fun tryGlVideo(dev: CameraDevice, st: SurfaceTexture, ch: CameraCharacteristics, vs: Size, fps: Int, unlock: Boolean, stab: Boolean): Boolean {
+        val sensorOri = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val portrait = sensorOri % 180 == 90
+        val upW = if (portrait) vs.height else vs.width
+        val upH = if (portrait) vs.width else vs.height
+        val pl = GlPipeline(ctx, st, 1, 0)
+        pl.aspect[0] = upW.toFloat() / upH
+        pl.sensorOri[0] = sensorOri
+        pl.mirror[0] = front && prefs.mirrorFront
+        val bi = prefs.beauty.coerceIn(0, 4)
+        pl.beauty = Beauty.SMOOTH[bi]
+        pl.bright = Beauty.BRIGHT[bi]
+        pl.outW = upW
+        pl.outH = upH
+        var gyroUsed = false
+        if (stab && prefs.stabGyro && !front) {
+            val focal = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
+            val phys = ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val fpx = if (focal > 0f && phys != null && phys.width > 0f) focal / phys.width * vs.width
+            else (vs.width / 2f) / Math.tan(Math.toRadians(35.0)).toFloat()
+            val realtime = ch.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+                CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
+            gyroUsed = pl.enableStab(0, fpx, upW.toFloat(), upH.toFloat(), realtime, prefs.stabLevel)
+            if (!gyroUsed) msg("Gyroscope tidak tersedia, memakai EIS bawaan")
+        }
+        val surfaces: List<Surface>
+        try {
+            st.setDefaultBufferSize(upW, upH)
+            bufSize = Size(upW, upH)
+            surfaces = pl.start(listOf(vs))
+        } catch (t: Throwable) {
+            CamLog.add("GL gagal: ${t.message}")
+            try { pl.release() } catch (_: Throwable) {}
+            glDisabled = true
+            msg("Renderer GL gagal, memakai jalur video biasa")
+            return false
+        }
+        pipeline = pl
+        glOut = Size(upW, upH)
+        previewSize = vs
+        main.post { cb.onPreviewSize(vs.width, vs.height); cb.onViewMirror(false) }
+        val hint = ((jpegOrientation() - sensorOri) % 360 + 360) % 360
+        prepareRecorder(Size(upW, upH), fps, false, hint)
+
+        val b = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+        b.addTarget(surfaces[0])
+        builder = b
+        applyCommon(b, true)
+        pickFpsRange(ch, fps, unlock && attempt == 0)?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        val halEis = stab && !gyroUsed
+        applyStabilization(b, halEis, unlock && attempt == 0 && halEis)
+        videoEis = stab
+        stabKind = if (gyroUsed) 2 else if (halEis) 1 else 0
+        CamLog.add("video GL ${mode.name} attempt=$attempt ${vs.width}x${vs.height}@$fps keluar=${upW}x$upH gyro=$gyroUsed halEis=$halEis beauty=$bi")
+        main.post { cb.onVideoStatus(vs.height, fps, stab, false) }
+        createSession(dev, listOf(surfaces[0]), b, attempt < 2)
+        return true
     }
 
     private fun pickFpsRange(ch: CameraCharacteristics, fps: Int, force: Boolean): Range<Int>? {
@@ -604,10 +758,17 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             b.set(CaptureRequest.FLASH_MODE, if (torch) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
         }
 
+        if (wantFaces() && has(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES, CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE))
+            b.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE)
+        if (mode == Mode.PRO && awb != CaptureRequest.CONTROL_AWB_MODE_AUTO && has(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES, awb))
+            b.set(CaptureRequest.CONTROL_AWB_MODE, awb)
+        else if (has(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES, CaptureRequest.CONTROL_AWB_MODE_AUTO))
+            b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+
         if (attempt >= 2) return
 
         if (ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null)
-            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, clampZoom(zoom))
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, halZoom())
 
         if (attempt >= 1) return
 
@@ -621,6 +782,10 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
                 Mode.PORTRAIT -> if (scenes.contains(CaptureRequest.CONTROL_SCENE_MODE_PORTRAIT)) {
                     b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
                     b.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_PORTRAIT)
+                }
+                Mode.FACE -> if (scenes.contains(CaptureRequest.CONTROL_SCENE_MODE_FACE_PRIORITY)) {
+                    b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+                    b.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_FACE_PRIORITY)
                 }
                 Mode.NIGHT -> if (scenes.contains(CaptureRequest.CONTROL_SCENE_MODE_NIGHT)) {
                     b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
@@ -683,6 +848,8 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
     private fun announceMode() {
         if (attempt >= 1) return
         when (mode) {
+            Mode.FACE -> if (!has(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES, CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE))
+                msg("Perangkat tidak mendukung deteksi wajah")
             Mode.PORTRAIT -> msg("Potret: blur latar diterapkan setelah foto (wajah harus terlihat)")
             Mode.NIGHT -> msg(
                 if (has(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES, CaptureRequest.CONTROL_SCENE_MODE_NIGHT))
@@ -721,11 +888,47 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExp = it }
             if (mode.video) trackFps(result)
+            if (wantFaces()) {
+                if ((++faceTick) % 2 == 0) processFaces(result)
+            } else if (lastFaceCount != 0) {
+                lastFaceCount = 0
+                main.post { cb.onFaces(emptyList()) }
+            }
         }
 
         override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
             CamLog.add("capture gagal reason=${failure.reason}")
         }
+    }
+
+    private fun processFaces(result: TotalCaptureResult) {
+        val faces = result.get(CaptureResult.STATISTICS_FACES) ?: return
+        val r = chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+        val hz = halZoom()
+        val e = extraZoom
+        val mir = front && prefs.mirrorFront
+        val out = ArrayList<android.graphics.RectF>()
+        for (f in faces) {
+            if (f.score < 40) continue
+            val bd = f.bounds
+            val xs = floatArrayOf((bd.left - r.left) / r.width().toFloat(), (bd.right - r.left) / r.width().toFloat())
+            val ys = floatArrayOf((bd.top - r.top) / r.height().toFloat(), (bd.bottom - r.top) / r.height().toFloat())
+            var uMin = 9f; var vMin = 9f; var uMax = -9f; var vMax = -9f
+            for (sx in xs) for (sy in ys) {
+                val sx0 = 0.5f + (sx - 0.5f) * hz
+                val sy0 = 0.5f + (sy - 0.5f) * hz
+                var u: Float
+                var v: Float
+                if (!front) { u = 1f - sy0; v = sx0 } else { u = if (mir) 1f - sy0 else sy0; v = 1f - sx0 }
+                u = 0.5f + (u - 0.5f) * e
+                v = 0.5f + (v - 0.5f) * e
+                if (u < uMin) uMin = u; if (u > uMax) uMax = u
+                if (v < vMin) vMin = v; if (v > vMax) vMax = v
+            }
+            out.add(android.graphics.RectF(uMin, vMin, uMax, vMax))
+        }
+        lastFaceCount = out.size
+        main.post { cb.onFaces(out) }
     }
 
     private fun trackFps(r: TotalCaptureResult) {
@@ -740,7 +943,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         if (dt >= 1_000_000_000L) {
             val fps = (fpsFrames * 1e9 / dt).roundToInt()
             val st = r.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
-            val eisOn = st != null && st != CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+            val eisOn = (st != null && st != CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE_OFF) || stabKind == 2
             val h = videoHeight
             fpsWindowStart = ts
             fpsFrames = 0
@@ -795,7 +998,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
                     if (flash == 2) CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH else CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
             }
             if (prefs.shutterSound) sound.play(MediaActionSound.SHUTTER_CLICK)
-            shotModes.add(mode)
+            shotModes.add(Shot(mode, extraZoom))
             s.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
                     msg("Gagal mengambil foto")
@@ -821,17 +1024,32 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     private fun savePhoto(raw: ByteArray) {
         try {
-            val shotMode = shotModes.poll() ?: Mode.AI_CAM
+            val shot = shotModes.poll()
+            val shotMode = shot?.mode ?: Mode.AI_CAM
+            val extra = shot?.extra ?: 1f
             var bytes = raw
             var processed = false
             val wantPortrait = shotMode == Mode.PORTRAIT
-            if (wantPortrait || prefs.watermark) {
+            val wantBeauty = prefs.beauty > 0
+            if (wantPortrait || wantBeauty || prefs.watermark || extra > 1.02f) {
                 try {
-                    val bmp = Watermark.loadUpright(raw)
+                    var bmp = Watermark.loadUpright(raw)
                     var changed = false
+                    if (extra > 1.02f) {
+                        val cw = (bmp.width / extra).toInt().coerceAtLeast(16)
+                        val chh = (bmp.height / extra).toInt().coerceAtLeast(16)
+                        val c = Bitmap.createBitmap(bmp, (bmp.width - cw) / 2, (bmp.height - chh) / 2, cw, chh)
+                        if (c !== bmp) bmp.recycle()
+                        bmp = if (c.isMutable) c else c.copy(Bitmap.Config.ARGB_8888, true).also { c.recycle() }
+                        changed = true
+                    }
                     if (wantPortrait) {
                         if (Portrait.apply(bmp)) changed = true
                         else msg("Wajah tidak terdeteksi, efek potret tidak diterapkan")
+                    }
+                    if (wantBeauty) {
+                        if (Beauty.applyPhoto(bmp, prefs.beauty)) changed = true
+                        else msg("Wajah tidak terdeteksi, beauty tidak diterapkan")
                     }
                     if (prefs.watermark) {
                         Watermark.draw(bmp, Watermark.text(ctx, prefs), prefs.wmPos)
@@ -874,7 +1092,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
 
     // --------------------------------------------------------------- video
 
-    private fun prepareRecorder(size: Size, fps: Int, timelapse: Boolean): Surface {
+    private fun prepareRecorder(size: Size, fps: Int, timelapse: Boolean, hint: Int = -1): Surface {
         val resolver = ctx.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, "VID_${stamp()}.mp4")
@@ -911,7 +1129,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
             r.setAudioEncodingBitRate(128_000)
             r.setAudioSamplingRate(44_100)
         }
-        r.setOrientationHint(jpegOrientation())
+        r.setOrientationHint(if (hint >= 0) hint else jpegOrientation())
         r.prepare()
         return r.surface
     }
@@ -922,6 +1140,7 @@ class CameraController(private val ctx: Context, private val prefs: Prefs, priva
         val pfd = pendingPfd
         var ok = true
         try { session?.stopRepeating(); session?.abortCaptures() } catch (_: Exception) {}
+        pipeline?.detachRecorder()
         try { r.stop() } catch (_: RuntimeException) { ok = false }
         try { r.release() } catch (_: Exception) {}
         try { pfd?.close() } catch (_: Exception) {}

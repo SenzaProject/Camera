@@ -41,7 +41,7 @@ class SettingsActivity : Activity() {
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.BLACK)
+        root.background = AuroraDrawable()
 
         header = FrameLayout(this)
         val back = IconView(this, Ic.BACK)
@@ -87,7 +87,7 @@ class SettingsActivity : Activity() {
     private fun card(vararg rows: View) {
         val c = LinearLayout(this)
         c.orientation = LinearLayout.VERTICAL
-        c.background = GradientDrawable().apply { setColor(C.CARD); cornerRadius = dpf(16f) }
+        c.background = GlassDrawable(this, dpf(18f), 0x4A2C2C34, false)
         for ((i, r) in rows.withIndex()) {
             if (i > 0) {
                 val sep = View(this)
@@ -201,6 +201,35 @@ class SettingsActivity : Activity() {
             }
         )
 
+        section("Stabilizer")
+        card(
+            switchRow("Peredam guncangan", "Sama dengan tombol di kanan atas mode video", { prefs.eis }) { prefs.eis = it }.first,
+            switchRow("EIS Plus (gyroscope)",
+                "Stabilizer perangkat lunak berbasis gyro. Tetap bekerja di 1080p 60 fps walau EIS bawaan ditolak HAL. Hanya kamera belakang",
+                { prefs.stabGyro }) { prefs.stabGyro = it }.first,
+            valueRow("Kekuatan", "Makin kuat, makin banyak tepi gambar terpotong", {
+                when (prefs.stabLevel) { 0 -> "Ringan"; 2 -> "Kuat"; else -> "Normal" }
+            }) { prefs.stabLevel = cycle(listOf(0, 1, 2), prefs.stabLevel) }
+        )
+
+        section("Beauty dan wajah")
+        card(
+            valueRow("Preset beauty", "Foto dan video (belum untuk video ganda)", { Beauty.name(prefs.beauty) }) {
+                prefs.beauty = (prefs.beauty + 1) % Beauty.NAMES.size
+            },
+            switchRow("Deteksi wajah", "Kotak wajah di pratinjau", { prefs.faceDetect }) { prefs.faceDetect = it }.first
+        )
+
+        section("Tampilan")
+        card(
+            switchRow("Kaca cair (blur nyata)", "Latar panel diburamkan dari pratinjau kamera. Matikan untuk hemat baterai",
+                { prefs.glass }) { prefs.glass = it }.first,
+            switchRow("Cermin pratinjau kamera depan", null, { prefs.mirrorFront }) { prefs.mirrorFront = it }.first,
+            valueRow("Tata letak video ganda", null, { if (prefs.dualLayout == 0) "Atas-bawah" else "Gambar dalam gambar" }) {
+                prefs.dualLayout = 1 - prefs.dualLayout
+            }
+        )
+
         section("Watermark")
         val devRef = valueRowRef("Nama perangkat terdeteksi", "Ketuk untuk deteksi ulang", { prefs.deviceName.ifBlank { "…" } }) {}
         devRef.first.setOnClickListener {
@@ -245,7 +274,7 @@ class SettingsActivity : Activity() {
         )
 
         section("Tentang")
-        card(infoRow("Camera 1.2", "SenzaProject"))
+        card(infoRow("Camera 1.0 Beta", "SenzaProject"))
     }
 
     private fun editWatermark(done: () -> Unit) {

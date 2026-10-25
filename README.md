@@ -25,3 +25,11 @@ git push -u origin main
 - Mode Potret: blur latar berbasis deteksi wajah (diterapkan setelah foto), bukan bokeh kedalaman
 - Pesan penjelas tiap mode (apakah fitur didukung perangkat atau tidak)
 - Nama watermark tidak lagi ditempeli merek dari Build.MANUFACTURER (ROM bisa memalsukannya)
+
+## 1.0 Beta
+- Zoom hingga 12x (zoom HAL, sisanya digital; video dibatasi zoom HAL)
+- Slider cahaya (exposure) di samping cincin fokus
+- Video Ganda (depan atas, belakang bawah / gambar-dalam-gambar), target 1080p 60 fps, turun otomatis bila ditolak
+- Tombol peredam guncangan di kanan atas mode video + EIS Plus (stabilizer gyroscope di renderer GL)
+- Deteksi wajah (mode di Lainnya + toggle), preset beauty foto dan video, mode MANUAL dengan white balance
+- UI kaca cair: blur latar nyata dari pratinjau (bisa dimatikan di Pengaturan)
